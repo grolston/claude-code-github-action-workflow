@@ -1,0 +1,164 @@
+name: Claude Agent on AWS Bedrock
+
+# Required:
+# You need to ensure you have GITHUB_AGENT_USER set as
+# either a repo or an github organization variable.
+# This variable value needs to be the machine user alias
+# you assign and issue or @-mention in PRs
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [assigned]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  checks: read
+  id-token: write  # required for OIDC
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issues' && github.event.assignee.login == vars.GITHUB_AGENT_USER) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, format('@{0}', vars.GITHUB_AGENT_USER)) && github.event.comment.user.login != format('{0}[bot]', vars.GITHUB_AGENT_USER)) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, format('@{0}', vars.GITHUB_AGENT_USER)) && github.event.comment.user.login != format('{0}[bot]', vars.GITHUB_AGENT_USER))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.AGENT_CLIENT_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.AGENT_APP_ID }} # deprecated for client-id but will still work
+
+      # Checkout using the App token so pushes are authorized as the App.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      # If this run was triggered from a comment on an EXISTING PR, switch the
+      # working tree to that PR's head branch so Claude sees and pushes to it.
+      - name: Checkout PR branch (comment on PR conversation)
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+        run: gh pr checkout ${{ github.event.issue.number }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Checkout PR branch (comment on PR diff)
+        if: github.event_name == 'pull_request_review_comment'
+        run: gh pr checkout ${{ github.event.pull_request.number }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_DEV }}
+          aws-region: us-east-1
+          role-session-name: ${{ vars.GITHUB_AGENT_USER }}-foundation
+
+      # Choose the model from a `model:<name>` label on the issue/PR.
+      # Falls back to a default when no such label is present.
+      - name: Pick model from label
+        id: pick-model
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+            NUMBER=${{ github.event.pull_request.number }}
+          else
+            NUMBER=${{ github.event.issue.number }}
+          fi
+
+          # PRs are issues in the API, so this works for both.
+          LABELS=$(gh api "repos/${{ github.repository }}/issues/$NUMBER" --jq '.labels[].name')
+
+          # First `model:*` label wins; normalize to lowercase, strip spaces.
+          KEY=$(echo "$LABELS" | grep -i '^model:' | head -n1 | cut -d: -f2- \
+                | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+
+          # Map label -> Bedrock model id. Claude Code only runs on Claude models,
+          # so the cost tiers below are the Claude family. Confirm each id matches
+          # an inference profile you've enabled in Bedrock (mirror your working
+          # opus entry's format; some models use dated ids like
+          # us.anthropic.claude-haiku-4-5-20251001-v1:0).
+          #
+          # Cost per 1M tokens (input/output), approx:
+          #   haiku  $1 / $5     cheap  - docs, renames, config, one-file fixes
+          #   fable5 (confirm)   -      - Fable 5 (verify Bedrock pricing/availability)
+          #   sonnet $3 / $15    mid    - most feature/bugfix work
+          #   opus   $5 / $25    max    - hard, multi-file, architectural work
+          case "$KEY" in
+            haiku|haiku4-5|cheap)      MODEL="us.anthropic.claude-haiku-4-5" ;;
+            fable5|fable-5|fable)      MODEL="us.anthropic.claude-fable-5" ;;
+            sonnet|sonnet5|sonnet-5)   MODEL="us.anthropic.claude-sonnet-5" ;;
+            opus|opus4-8|opus-4-8|max) MODEL="us.anthropic.claude-opus-4-8" ;;
+            *)                         MODEL="us.anthropic.claude-sonnet-5" ;;  # default: balanced cost
+          esac
+
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "Selected model: $MODEL (from label '${KEY:-<none>}')"
+
+          # Max turns: default 60, override via a `max-turns:<n>` label.
+          TURNS=$(echo "$LABELS" | grep -iE '^max-turns:' | head -n1 | cut -d: -f2- | tr -d ' ')
+          case "$TURNS" in
+            ''|*[!0-9]*) TURNS=60 ;;   # missing or non-numeric -> default
+          esac
+          echo "max_turns=$TURNS" >> "$GITHUB_OUTPUT"
+          echo "Max turns: $TURNS"
+
+      - uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          use_bedrock: "true"
+          github_token: ${{ steps.app-token.outputs.token }}
+          prompt: |
+            First determine your context from the triggering event:
+
+            - IF you were triggered by a comment on an EXISTING pull request
+              (issue_comment on a PR, or a pull_request_review_comment), then that
+              PR's feature branch is ALREADY CHECKED OUT. Make the requested
+              changes, run tests, and COMMIT AND PUSH to this same branch. Do NOT
+              create a new branch and do NOT open a new PR. Reply to the comment/PR
+              with a status summary of what you changed.
+
+            - IF you were triggered by a newly assigned ISSUE, create a feature
+              branch, make the changes, run tests, and open a PR referencing the
+              issue.
+
+            Handle these cases explicitly:
+
+            - ALREADY IMPLEMENTED: if the issue describes something that already
+              exists, post a comment explaining where it's implemented (file paths)
+              and do not open a PR.
+
+            - UNCLEAR REQUIREMENTS: if the issue is ambiguous or missing details
+              needed to implement it correctly, do NOT guess. Post a comment with
+              your specific questions and stop. Do not open a PR.
+
+            - BLOCKED / CANNOT COMPLETE: if you cannot finish (failing environment,
+              missing access, tests that won't pass for reasons outside the change,
+              conflicts with the constraints in CLAUDE.md), post a comment
+              describing what you attempted, exactly what is blocking you, and what
+              a human needs to do. If partial work is committed to a branch, name
+              the branch. Do not open a PR with failing tests.
+
+            - PARTIAL SCOPE: if you can complete some acceptance criteria but not
+              others, say so in the PR description — list what's done and what
+              remains, and comment on the issue with the same summary.
+
+            Only open a new PR when tests pass and the work is genuinely ready
+            for review.
+          claude_args: |
+            --model ${{ steps.pick-model.outputs.model }}
+            --max-turns ${{ steps.pick-model.outputs.max_turns }}
+            --dangerously-skip-permissions
