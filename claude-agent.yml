@@ -26,8 +26,8 @@ jobs:
   claude:
     if: |
       (github.event_name == 'issues' && github.event.assignee.login == vars.GITHUB_AGENT_USER) ||
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, format('@{0}', vars.GITHUB_AGENT_USER)) && github.event.comment.user.login != format('{0}[bot]', vars.GITHUB_AGENT_USER)) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, format('@{0}', vars.GITHUB_AGENT_USER)) && github.event.comment.user.login != format('{0}[bot]', vars.GITHUB_AGENT_USER))
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, format('@{0}', vars.AGENT_GITHUB_USER)) && github.event.comment.user.login != format('{0}[bot]', vars.AGENT_GITHUB_USER)) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, format('@{0}', vars.AGENT_GITHUB_USER)) && github.event.comment.user.login != format('{0}[bot]', vars.AGENT_GITHUB_USER))
     runs-on: ubuntu-latest
     steps:
       - name: Generate GitHub App token
@@ -63,7 +63,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.DEPLOY_ROLE_DEV }}
           aws-region: us-east-1
-          role-session-name: ${{ vars.GITHUB_AGENT_USER }}-foundation
+          role-session-name: ${{ vars.AGENT_GITHUB_USER }}
 
       # Choose the model from a `model:<name>` label on the issue/PR.
       # Falls back to a default when no such label is present.
